@@ -53,19 +53,19 @@ note() {
 # drops its reply then) or in a bare shell. Gives up after a day, or when the terminal is gone.
 # With a <lane>, the notice is dropped once that lane is no longer working (a stopped notice gone stale).
 deliver() { # <t> <text> [<lane>]
-  local t=$1 msg=$2 lane=${3:-} st end=$(($(date +%s) + 86400)) since
+  local t=$1 msg=$2 lane=${3:-} st end=$(($(date +%s) + 86400))
   while [ "$(date +%s)" -lt "$end" ]; do
     if [ -n "$lane" ] && [ "$(hc get "$lane" --json 2>/dev/null | jq -r '.labels.lane_state // "-"')" != working ]; then return 0; fi
     st=$(hc get "$t" --json 2>/dev/null | jq -r 'if .state != "live" then "gone" else (.status.state // "none") end') || st=gone
+    # A wait that starts just after the turn ended blocks until its timeout, hence the short one. A blocked
+    # agent or a bare shell gets a check every 30 s.
     case $st in
       gone) return 0 ;;
       idle) hc send --if idle "$t" "$msg" >/dev/null 2>&1 && return 0 ;;
       "done") hc send "$t" "$msg" >/dev/null 2>&1 && return 0 ;;
+      working) hc wait "$t" --timeout 30 >/dev/null 2>&1 || true ;;
+      *) sleep 30 ;;
     esac
-    since=$SECONDS
-    hc wait "$t" --timeout 300 >/dev/null 2>&1 || true
-    # A blocked agent or a bare shell returns at once: check back every 30 s, not in a tight loop.
-    if [ $((SECONDS - since)) -lt 5 ]; then sleep 30; fi
   done
 }
 
