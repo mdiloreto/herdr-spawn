@@ -7,15 +7,15 @@
 #   1. A column with fewer panes than the tallest column is filled first: split its largest pane "down".
 #   2. Otherwise every column has R panes. With C columns: C <= R adds a column ("right"), C > R a row ("down").
 # Columns are panes grouped by left edge (rect.x). The caller's pane wins ties within 10% area.
-# --tab <dir> (before the positionals, Herdr TUI/UI only, not with <pane-id> <right|down>) opens a new tab with cwd <dir> instead.
-# --lane <unit|driver> (before the positionals, Herdr TUI/UI only, needs HERDR_PANE_ID) registers the child as a lane of
+# --tab <dir> (before the positionals, not with <pane-id> <right|down>) opens a new tab with cwd <dir> instead.
+# --lane <unit|driver> (before the positionals) registers the child as a lane of
 # the calling pane: LANE_MODE and LANE_COORDINATOR are exported in its shell, its pane gets lane_of, lane_mode and
 # lane_state metadata tokens, and lanes-watch.sh runs for the caller (lane.sh is the lane's side of the protocol).
 # --goal "<objective with its done criterion>" is required with --lane and refused without it: a lane always has a
 # goal from its coordinator. The lane's prompt becomes a composed file in the state dir (lane protocol, goal, then
 # the caller's brief), and the lane launches from a `lane:<agent>` template that holds the harness to the goal.
-# In the Herdr app (HC_TERMINAL_ID set, no HERDR_ENV) it splits through herdr-app instead, leaves naming to the
-# launch template, and prints "<terminal> <name> <app> <state>"; see the block below the jq check.
+# In the Herdr app (HC_TERMINAL_ID set, no HERDR_ENV) it starts the child with `hc run`, names the terminal, and
+# prints "<terminal> <name> <app> <state>"; see the block below the jq check.
 # Launch templates come from built-in defaults, overridden or extended by the config file
 # ${HERDR_SPAWN_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-spawn/agents.conf}: one "<agent> <template>" per
 # line; blank lines and full-line # comments are ignored. With --lane the key is `lane:<agent>`. Placeholders,
@@ -140,30 +140,51 @@ launch=$(expand "$template")
 
 command -v jq >/dev/null || die "jq is required"
 
-# The Herdr app (herdr-core, `hc`) sets HC_TERMINAL_ID instead of HERDR_ENV. It shows no pane geometry, so
-# without a pane/direction the child splits the caller's pane to the right. The launch line runs in an
-# interactive instance of the user's shell (wrappers, aliases and functions apply), replaced by a plain
-# shell once the agent exits. A split doesn't take the person's focus.
+# The lane's prompt: protocol (with lane.sh's absolute path), the goal, then the caller's brief. Written only once
+# the name is known to be free, so a rejected duplicate never touches a live lane's prompt.
+compose_lane() {
+  [ -n "$lane" ] || return 0
+  mkdir -p "$statedir"
+  local protocol
+  protocol=$(cat "$scriptdir/../lane-protocol.md")
+  {
+    printf '%s\n\n## Goal\n\n%s\n\n## Brief\n\n' "${protocol//LANE_SH/$scriptdir/lane.sh}" "$goal"
+    cat "$callerprompt"
+  } >"$promptfile"
+}
+
+# The Herdr app (herdr-core, `hc`) sets HC_TERMINAL_ID instead of HERDR_ENV. Its window adopts any core terminal
+# labelled herdr.space and herdr.tab: a tab id it knows gets the terminal as a split, a new id becomes a new tab
+# named after the terminal's folder. Labels are the only route that also works when the window runs on another
+# machine than the agents (herdr-app lives with the window), so the child is a core terminal started with
+# `hc run`: the caller's child, so core tells the caller when it is blocked or exits, but kept when the caller
+# ends. The launch line runs in an interactive instance of the user's shell (wrappers, aliases and functions
+# apply), replaced by a plain shell once the agent exits. Adoption doesn't take the person's focus.
 if [ "${HERDR_ENV:-}" != 1 ] && [ -n "${HC_TERMINAL_ID:-}" ]; then
-  [ -z "$tabdir" ] || die "--tab needs the herdr TUI or Herdr UI (HERDR_ENV=1)"
-  [ -z "$lane" ] || die "--lane needs the herdr TUI or Herdr UI (HERDR_ENV=1)"
-  command -v herdr-app >/dev/null || die "herdr-app is required"
   command -v hc >/dev/null || die "hc (herdr-core) is required"
-  if [ $# -eq 5 ]; then
-    target=$4 dir=$5
+  [ $# -eq 3 ] || die "<pane-id> <right|down> needs the herdr TUI; in the Herdr app a child joins the caller's tab as a split"
+  me=$(hc get "$HC_TERMINAL_ID" --json) || die "hc get $HC_TERMINAL_ID failed"
+  space=$(jq -r '.labels["herdr.space"] // empty' <<<"$me")
+  [ -n "$space" ] || die "terminal $HC_TERMINAL_ID is in no Herdr app space (no herdr.space label)"
+  if [ -n "$tabdir" ]; then
+    tab=tb$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') cwd=$tabdir
   else
-    target=$(herdr-app ls | jq -r --arg t "$HC_TERMINAL_ID" \
-      '[.spaces[].tabs[].terminals[] | select(.terminal == $t) | .pane][0] // empty')
-    dir=right
-    [ -n "$target" ] || die "no pane shows terminal $HC_TERMINAL_ID; pass <pane-id> <right|down> (see herdr-app ls)"
+    tab=$(jq -r '.labels["herdr.tab"] // empty' <<<"$me") cwd=$PWD
+    [ -n "$tab" ] || die "terminal $HC_TERMINAL_ID is in no Herdr app tab (no herdr.tab label)"
   fi
+  if [ "$(hc get "$name" --json 2>/dev/null | jq -r .state)" = live ]; then die "terminal name '$name' is already taken"; fi
+  compose_lane
   shell=${SHELL:-/bin/sh}
-  line="cd $(printf %q "$PWD") && $launch; exec $(printf %q "$shell")"
-  split=$(herdr-app do pane.split --pane "$target" --direction "$dir" \
-    --argv "$(jq -cn --arg sh "$shell" --arg line "$line" '[$sh, "-ic", $line]')") ||
-    die "split of $target failed: $split"
-  term=$(jq -r '.terminal // empty' <<<"$split")
-  [ -n "$term" ] || die "split of $target returned no terminal: $split"
+  args=(--bg --json --outlive-parent --name "$name" --cwd "$cwd" --label "herdr.space=$space" --label "herdr.tab=$tab")
+  if [ -n "$lane" ]; then
+    # Labelled before the agent starts, so a lane that reports at once is never overwritten by a late label.
+    args+=(--label "lane_of=$HC_TERMINAL_ID" --label "lane_mode=$lane" --label lane_state=working
+      --label "lane_report=$(date +%s)-$$-$RANDOM")
+    launch="export LANE_MODE=$(printf %q "$lane"); export LANE_COORDINATOR=$(printf %q "$HC_TERMINAL_ID"); $launch"
+  fi
+  run=$(hc run "${args[@]}" -- "$shell" -ic "$launch; exec $(printf %q "$shell")") || die "hc run failed: $run"
+  term=$(jq -r '.address // empty' <<<"$run")
+  [ -n "$term" ] || die "hc run returned no terminal: $run"
 
   status=
   for _ in $(seq 120); do
@@ -179,15 +200,7 @@ fi
 [ "${HERDR_ENV:-}" = 1 ] || die "not inside Herdr (neither HERDR_ENV=1 nor HC_TERMINAL_ID)"
 [ -z "$lane" ] || [ -n "${HERDR_PANE_ID:-}" ] || die "--lane needs HERDR_PANE_ID, the coordinator's pane"
 if herdr agent get "$name" >/dev/null 2>&1; then die "agent name '$name' is already taken"; fi
-if [ -n "$lane" ]; then
-  # The lane's prompt: protocol (with lane.sh's absolute path), the goal, then the caller's brief.
-  mkdir -p "$statedir"
-  protocol=$(cat "$scriptdir/../lane-protocol.md")
-  {
-    printf '%s\n\n## Goal\n\n%s\n\n## Brief\n\n' "${protocol//LANE_SH/$scriptdir/lane.sh}" "$goal"
-    cat "$callerprompt"
-  } >"$promptfile"
-fi
+compose_lane
 
 if [ -n "$tabdir" ]; then
   tabcmd=(herdr tab create)

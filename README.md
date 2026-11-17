@@ -4,7 +4,7 @@ A skill that lets a coding agent spawn another agent session (`claude`, `codex`,
 
 ## Requirements
 
-- Herdr 0.9.1 or newer, with the caller running inside a Herdr pane; or the Herdr app, with `herdr-app` and `hc` (herdr-core) on `PATH`
+- Herdr 0.9.1 or newer, with the caller running inside a Herdr pane; or the Herdr app, with `hc` (herdr-core) on `PATH` on the machine that runs the agents (the app's window may run on another machine)
 - `jq`
 - A bash- or zsh-compatible shell in the pane (the launch line uses `$(cat …)`)
 - Recommended: the built-in Herdr skill, which covers prompting, waiting, reading and dialogs: `npx skills add herdrdev/herdr --skill herdr -g`
@@ -44,7 +44,7 @@ Ask in natural language:
 
 ## Lanes
 
-A child that changes a repo gets its own worktree and its own tab: `spawn.sh --tab <worktree> --lane <unit|driver> --goal "<objective and done criterion>" <agent> <name> <prompt-file>` opens a tab labelled `<name>` at the worktree without taking focus (herdr TUI or Herdr UI). Its prompt sets `Lane mode: unit` (execute one unit, reviewed by the caller) or `Lane mode: driver` (own a whole task, delegate it to subagents, report the verified result); keep that line even with `--lane`, for harnesses without a gate. `--lane` also exports `LANE_MODE` and `LANE_COORDINATOR` to the lane and tags its pane (the `hierarchical-implementation` gate reads `LANE_MODE`). That gives a three-level hierarchy: the session you talk to, lanes in tabs, and each driver lane's subagents.
+A child that changes a repo gets its own worktree and its own tab: `spawn.sh --tab <worktree> --lane <unit|driver> --goal "<objective and done criterion>" <agent> <name> <prompt-file>` opens a tab at the worktree without taking focus, labelled `<name>` in the herdr TUI or Herdr UI and named by the app in the Herdr app. Its prompt sets `Lane mode: unit` (execute one unit, reviewed by the caller) or `Lane mode: driver` (own a whole task, delegate it to subagents, report the verified result); keep that line even with `--lane`, for harnesses without a gate. `--lane` also exports `LANE_MODE` and `LANE_COORDINATOR` to the lane and tags its pane (the `hierarchical-implementation` gate reads `LANE_MODE`). That gives a three-level hierarchy: the session you talk to, lanes in tabs, and each driver lane's subagents.
 
 `--goal` is required with `--lane` and refused without it, so a lane always has a goal. `spawn.sh` composes the lane's prompt into `herdr-spawn`'s state dir as `lane-<name>.md`: the lane protocol, the goal, then your prompt file.
 
@@ -57,6 +57,12 @@ A lane declares its state with `scripts/lane.sh`, which sets a `lane_state` pane
 
 ```bash
 herdr agent list | jq '.result.agents[] | select(.tokens.lane_of == env.HERDR_PANE_ID) | {name, agent, agent_status, lane_mode: .tokens.lane_mode, cwd}'
+```
+
+In the Herdr app (`HC_TERMINAL_ID` set, no `HERDR_ENV`) the coordinator is your terminal and lanes are its herdr-core children, so the same roles work without a watcher. The lane state is kept in terminal labels instead of pane tokens. `done` and `escalate` send their notice to the coordinator themselves, as an `<hc from=…>` message once it is idle. herdr-core tells the coordinator when a lane is blocked or exits. A lane's stop hook sends `stopped` when it lets the lane stop without a report. There is no `stalled` notice. Lanes outlive the coordinator, so restarting it keeps them. The live status table:
+
+```bash
+hc ls --label lane_of=$HC_TERMINAL_ID
 ```
 
 ### Roles
@@ -107,7 +113,7 @@ codex   my-codex-alias {prompt}
 gemini  gemini -i {prompt}
 ```
 
-The line is typed into the pane's interactive shell with `herdr pane run`, which is why wrappers, aliases and functions apply (`herdr agent start` runs the bare executable instead). In the Herdr app the new pane runs it with `$SHELL -ic`, for the same reason.
+The line is typed into the pane's interactive shell with `herdr pane run`, which is why wrappers, aliases and functions apply (`herdr agent start` runs the bare executable instead). In the Herdr app `hc run` starts the child's terminal with `$SHELL -ic`, for the same reason. The app shows a herdr-core terminal labelled `herdr.space` and `herdr.tab`: an id it knows adds the terminal to that tab as a split, and a new id opens a new tab. Labels also work when the window runs on another machine.
 
 ## License
 
