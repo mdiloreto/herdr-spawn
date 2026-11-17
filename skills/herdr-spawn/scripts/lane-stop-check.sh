@@ -14,9 +14,9 @@
 set -uo pipefail
 
 app=
-if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-  pane=$HERDR_PANE_ID
-  command -v herdr >/dev/null || exit 0
+if [ "${HERDR_ENV:-}" = 1 ]; then
+  pane=${HERDR_PANE_ID:-}
+  { [ -n "$pane" ] && command -v herdr >/dev/null; } || exit 0
 elif [ -n "${HC_TERMINAL_ID:-}" ]; then
   pane=$HC_TERMINAL_ID app=1
   command -v hc >/dev/null || exit 0
@@ -70,7 +70,7 @@ if [ "$n" -ge 3 ]; then
     if command -v setsid >/dev/null; then detach=setsid; fi
     "$detach" "$dir/lane.sh" _deliver "$LANE_COORDINATOR" \
       "[lane $name] stopped without reporting done or escalating. Check it: hc read $name --lines 120; nudge it with: $dir/lane.sh reply $name \"<what to do next>\"" \
-      >/dev/null 2>&1 </dev/null &
+      "$pane" >/dev/null 2>&1 </dev/null &
   fi
   exit 0
 fi

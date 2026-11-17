@@ -38,6 +38,9 @@ set_state() { # <pane> <coordinator> <mode> <state> [k=v ...]
     die "could not record lane_state=$state on $pane"
 }
 
+# Runs a command in its own session, so it outlives this script and the caller's tool call.
+detached() { if command -v setsid >/dev/null; then setsid "$@"; else nohup "$@"; fi; }
+
 # One line, capped so herdr's silent cut at 79 characters shows as "...".
 note() {
   local t
@@ -48,17 +51,21 @@ note() {
 
 # Herdr app: types <text> into terminal <t> once its agent is idle or done, so it never lands mid-turn (OpenCode
 # drops its reply then) or in a bare shell. Gives up after a day, or when the terminal is gone.
-deliver() { # <t> <text>
-  local t=$1 msg=$2 st end=$(($(date +%s) + 86400))
+# With a <lane>, the notice is dropped once that lane is no longer working (a stopped notice gone stale).
+deliver() { # <t> <text> [<lane>]
+  local t=$1 msg=$2 lane=${3:-} st end=$(($(date +%s) + 86400)) since
   while [ "$(date +%s)" -lt "$end" ]; do
+    if [ -n "$lane" ] && [ "$(hc get "$lane" --json 2>/dev/null | jq -r '.labels.lane_state // "-"')" != working ]; then return 0; fi
     st=$(hc get "$t" --json 2>/dev/null | jq -r 'if .state != "live" then "gone" else (.status.state // "none") end') || st=gone
     case $st in
       gone) return 0 ;;
       idle) hc send --if idle "$t" "$msg" >/dev/null 2>&1 && return 0 ;;
       "done") hc send "$t" "$msg" >/dev/null 2>&1 && return 0 ;;
     esac
+    since=$SECONDS
     hc wait "$t" --timeout 300 >/dev/null 2>&1 || true
-    sleep 5
+    # A blocked agent or a bare shell returns at once: check back every 30 s, not in a tight loop.
+    if [ $((SECONDS - since)) -lt 5 ]; then sleep 30; fi
   done
 }
 
@@ -68,15 +75,18 @@ case $cmd in
     ;;
   working) [ $# -eq 1 ] || die "$usage" ;;
   reply) [ $# -eq 3 ] && [ -n "$3" ] || die "$usage" ;;
-  _deliver) [ -n "$app" ] && [ $# -eq 3 ] || die "$usage"; deliver "$2" "$3"; exit 0 ;;
+  _deliver) [ -n "$app" ] && [ $# -ge 3 ] || die "$usage"; deliver "$2" "$3" "${4:-}"; exit 0 ;;
   *) die "$usage" ;;
 esac
 
 if [ "$cmd" = reply ] && [ -n "$app" ]; then
   lane=$2
   info=$(hc get "$lane" --json 2>/dev/null) && [ "$(jq -r .state <<<"$info")" = live ] || die "no live terminal $lane"
-  read -r term of mode < <(jq -r '"\(.address) \(.labels.lane_of // "-") \(.labels.lane_mode // "-")"' <<<"$info")
+  read -r term of mode st < <(jq -r '"\(.address) \(.labels.lane_of // "-") \(.labels.lane_mode // "-") \(.status.state // "none")"' <<<"$info")
   [ "$of" != - ] || die "$lane is not a lane (no lane_of label)"
+  [ "$of" = "$HC_TERMINAL_ID" ] || die "$lane is $of's lane, not yours"
+  # A lane whose agent exited is a bare shell: the answer would run as a command.
+  [ "$st" != none ] || die "$lane has no running agent (its agent exited); read it with: hc read $lane"
   set_state "$term" "$of" "$mode" working
   # hc send refuses a blocked agent; the lane's labels go back as they were.
   if ! hc send "$term" "$3" >/dev/null; then
@@ -92,6 +102,7 @@ if [ "$cmd" = reply ]; then
   info=$(herdr agent get "$lane") || die "no agent $lane"
   read -r pane of mode < <(jq -r '.result.agent | "\(.pane_id) \(.tokens.lane_of // "-") \(.tokens.lane_mode // "-")"' <<<"$info")
   [ "$of" != - ] || die "$lane is not a lane (no lane_of token)"
+  [ -z "${HERDR_PANE_ID:-}" ] || [ "$of" = "$HERDR_PANE_ID" ] || die "$lane is $of's lane, not yours"
   # Working first, so the watcher never sees the answered lane as still escalated or done; undone if the prompt fails.
   set_state "$pane" "$of" "$mode" working
   if ! herdr agent prompt "$lane" "$3" >/dev/null; then
@@ -103,11 +114,8 @@ if [ "$cmd" = reply ]; then
   fi
   statedir=${XDG_STATE_HOME:-$HOME/.local/state}/herdr-spawn
   mkdir -p "$statedir"
-  # Detached so the watcher outlives this script; it exits at once if one already runs.
-  detach='nohup'
-  if command -v setsid >/dev/null; then detach=setsid; fi
-  "$detach" "$dir/lanes-watch.sh" "$of" \
-    >>"$statedir/watch-${of//[!A-Za-z0-9_-]/_}.log" 2>&1 </dev/null &
+  # The watcher exits at once if one already runs.
+  detached "$dir/lanes-watch.sh" "$of" >>"$statedir/watch-${of//[!A-Za-z0-9_-]/_}.log" 2>&1 </dev/null &
   exit 0
 fi
 
@@ -135,6 +143,4 @@ else
   msg="[lane $name] escalation: $(note "$2"). Read the full question: $read_cmd; answer with: $dir/lane.sh reply $name \"<answer>\""
 fi
 # Detached so the lane can end its turn while the coordinator is still busy.
-detach='nohup'
-if command -v setsid >/dev/null; then detach=setsid; fi
-"$detach" "$dir/lane.sh" _deliver "$LANE_COORDINATOR" "$msg" >/dev/null 2>&1 </dev/null &
+detached "$dir/lane.sh" _deliver "$LANE_COORDINATOR" "$msg" >/dev/null 2>&1 </dev/null &
